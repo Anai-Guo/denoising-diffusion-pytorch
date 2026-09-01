@@ -77,6 +77,15 @@ class XMWrapper(Module):
         first_tensor = next(t for t in leaves if is_tensor(t))
         batch = first_tensor.shape[0]
 
+        # sample anything that must be shared before expanding candidates
+
+        if hasattr(self.flow_model, 'xm_shared_random_kwargs'):
+            random_kwargs = self.flow_model.xm_shared_random_kwargs(batch)
+
+            for key, value in random_kwargs.items():
+                if key not in kwargs:
+                    kwargs[key] = value
+
         if self.random_time_kwarg not in kwargs:
             assert hasattr(self.flow_model, self.random_time_method), f'flow_model must have a {self.random_time_method} method'
             fn = getattr(self.flow_model, self.random_time_method)

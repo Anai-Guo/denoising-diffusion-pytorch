@@ -411,7 +411,8 @@ class Unet(nn.Module):
         x,
         time,
         classes,
-        cond_drop_prob = None
+        cond_drop_prob = None,
+        cond_keep_mask = None
     ):
         batch, device = x.shape[0], x.device
 
@@ -421,8 +422,10 @@ class Unet(nn.Module):
 
         classes_emb = self.classes_emb(classes)
 
-        if cond_drop_prob > 0:
-            keep_mask = prob_mask_like((batch,), 1 - cond_drop_prob, device = device)
+        if cond_drop_prob > 0 or exists(cond_keep_mask):
+            keep_mask = default(cond_keep_mask, lambda: prob_mask_like((batch,), 1 - cond_drop_prob, device = device))
+            assert keep_mask.shape == (batch,)
+            keep_mask = keep_mask.to(device = device, dtype = torch.bool)
             null_classes_emb = repeat(self.null_classes_emb, 'd -> b d', b = batch)
 
             classes_emb = torch.where(
@@ -606,6 +609,20 @@ class GaussianDiffusion(nn.Module):
     def device(self):
         return self.betas.device
 
+    def random_times(self, batch_size):
+        return torch.randint(0, self.num_timesteps, (batch_size,), device = self.device).long()
+
+    def random_cond_keep_mask(self, batch_size):
+        keep_prob = 1. - self.model.cond_drop_prob
+        return prob_mask_like((batch_size,), keep_prob, device = self.device)
+
+    def xm_shared_random_kwargs(self, batch_size):
+        # condition dropping is shared across Forward XM candidates
+
+        return dict(
+            cond_keep_mask = self.random_cond_keep_mask(batch_size)
+        )
+
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
@@ -774,7 +791,7 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, *, classes, noise = None, loss_reduction = 'mean'):
+    def p_losses(self, x_start, t, *, classes, noise = None, cond_keep_mask = None, loss_reduction = 'mean'):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -784,7 +801,8 @@ class GaussianDiffusion(nn.Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, classes)
+        model_kwargs = dict(cond_keep_mask = cond_keep_mask) if exists(cond_keep_mask) else dict()
+        model_out = self.model(x, t, classes, **model_kwargs)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -806,13 +824,13 @@ class GaussianDiffusion(nn.Module):
 
         return loss.mean()
 
-    def forward(self, img, *args, loss_reduction = 'mean', **kwargs):
+    def forward(self, img, *args, times = None, cond_keep_mask = None, loss_reduction = 'mean', **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        times = default(times, lambda: self.random_times(b))
 
         img = normalize_to_neg_one_to_one(img)
-        return self.p_losses(img, t, *args, loss_reduction = loss_reduction, **kwargs)
+        return self.p_losses(img, times, *args, cond_keep_mask = cond_keep_mask, loss_reduction = loss_reduction, **kwargs)
 
 # example
 
